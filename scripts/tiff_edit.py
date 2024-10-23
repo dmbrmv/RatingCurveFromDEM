@@ -2,49 +2,58 @@
 
 import pathlib
 from typing import Optional, Tuple, Union
-import pandas as pd
+
 import geopandas as gpd
-from osgeo import gdal
-from shapely.geometry import Point
 import numpy as np
-import rasterio
+import pandas as pd
 from pysheds.grid import Grid
 from pysheds.view import Raster
+from shapely.geometry import Point
 
 
 def gauge_to_utm(
     gauge_series: gpd.GeoSeries, return_gdf: bool = False
 ) -> Optional[Union[Tuple[gpd.GeoSeries, int], Point]]:
-    """Convert geometry projected file to it metric projection.
+    """Convert geometry projected file to metric projection.
 
     Args:
     ----
         gauge_series (gpd.GeoSeries):
-            GeoDataFrame file with geometry in WGS-84
+            GeoSeries containing geometry in WGS-84.
 
         return_gdf (bool, optional):
-            If require just coordinates we return projected Point object.
-            Otherwise GeoDataFrame, and EPSG code for further trasnformations.
+            If True, return a GeoDataFrame with the projected geometry and EPSG code.
+            If False, return a Point object with the projected coordinates.
             Defaults to False.
 
     Returns:
     -------
-        Optional[ Union[Tuple[gpd.GeoSeries, int], Point]]
-
+        Optional[ Union[Tuple[gpd.GeoSeries, int], Point]]:
+            If return_gdf is True, returns a tuple containing the GeoDataFrame and EPSG code.
+            If return_gdf is False, returns a projected Point object.
     """
+    # Create GeoDataFrame from GeoSeries
     gdf_file = gpd.GeoSeries(gauge_series, crs=4326)
     gdf_file = gpd.GeoDataFrame(gdf_file, columns=["geometry"])
+
+    # Estimate UTM CRS and get EPSG code
     tiff_epsg = gdf_file.estimate_utm_crs().to_epsg()
+
+    # Extract x and y coordinates
     gdf_file["x"] = gdf_file["geometry"].x
     gdf_file["y"] = gdf_file["geometry"].y
+
+    # Project to UTM CRS
     gdf_file_crs = gdf_file.to_crs(tiff_epsg)
+
     if return_gdf:
         return (gdf_file, tiff_epsg)
+
     return gdf_file_crs["geometry"].values[0]
 
 
 def gauge_buffer_creator(
-    gauge_geometry: Point, ws_gdf: gpd.GeoSeries, tiff_epsg: int
+    gauge_geometry: Point, ws_gdf: Union[gpd.GeoSeries, gpd.GeoDataFrame], tiff_epsg: int
 ) -> Tuple[gpd.GeoDataFrame, Tuple[float, float, float, float], float, float]:
     """Create squared buffer for extent of flood modelling.
 
@@ -79,7 +88,7 @@ def gauge_buffer_creator(
         AREA_SIZE = 0.10
     else:
         # degrees
-        AREA_SIZE = 0.05
+        AREA_SIZE = 0.5
     acc_coef = (ws_area * 1e6) / (90 * 90)
     # create buffer for point
     buffer = gauge_geometry.buffer(AREA_SIZE, cap_style="square")
@@ -91,49 +100,12 @@ def gauge_buffer_creator(
     #    index=[0])
     buffer_gdf = gpd.GeoDataFrame(buffer_gdf, geometry="geometry", crs=4326)  # type: ignore
     buffer_gdf.loc[0, "geometry"] = buffer_isc
-    # !TODO find out does this transformation is neccessary
-    # buffer_gdf = buffer_gdf.to_crs(epsg=tiff_epsg)
-
     # get coords from buffer
     upper_left_x, lower_right_y, lower_right_x, upper_left_y = buffer.bounds
 
     wgs_window = (upper_left_x, upper_left_y, lower_right_x, lower_right_y)
 
     return (buffer_gdf, wgs_window, acc_coef, ws_area)
-
-
-def gdal_extent_clipper(
-    initial_tiff: str, extent: tuple, tmp_tiff: str, final_tiff: str, crs_epsg: int
-) -> None:
-    """Clip and reproject .tiff file for desired extent and epsg.
-
-    Args:
-    ----
-        initial_tiff (str): Ininitial .tiff file which need to be trimmed
-        extent (tuple): Min, max coordinates for area of interest
-        tmp_tiff (str): Name for file in temporary folder (trimmed, not projected)
-        final_tiff (str): Name for projected and trimmed file
-        crs_epsg (int): EPSG code
-
-    Returns:
-    -------
-        None
-
-    """
-    # clip big tiff for extent
-    merged_tiff = gdal.Translate(destName=tmp_tiff, srcDS=initial_tiff, projWin=extent)
-    merged_tiff.FlushCache()
-    # reproject for desired CRS
-    merged_tiff_proj = gdal.Warp(
-        destNameOrDestDS=final_tiff,
-        format="GTiff",
-        dstNodata=None,
-        srcDSOrSrcDSTab=tmp_tiff,
-        dstSRS=f"EPSG:{crs_epsg}",
-    )
-    merged_tiff_proj.FlushCache()
-
-    return None
 
 
 def fill_dem(dem_tiff: str, elv_fill: str) -> None:
@@ -150,15 +122,15 @@ def fill_dem(dem_tiff: str, elv_fill: str) -> None:
 
     """
     # Read raw DEM
-    grid = Grid.from_raster(dem_tiff)
-    dem = grid.read_raster(dem_tiff)
+    grid = Grid.from_raster(dem_tiff, nodata=0)
+    dem = grid.read_raster(dem_tiff, nodata=0)
     # Fill pits
     pit_filled_dem = grid.fill_pits(dem)
     # Fill depressions
     flooded_dem = grid.fill_depressions(pit_filled_dem)
     # Resolve flats
     inflated_dem = grid.resolve_flats(flooded_dem)
-    inflated_dem[inflated_dem < 0] = np.nan  # type: ignore
+    inflated_dem[inflated_dem < 0] = np.NaN  # type: ignore
     grid.to_raster(file_name=elv_fill, data=inflated_dem)
 
     return None
@@ -223,7 +195,7 @@ def find_posts_coords(post_num: int, config: dict, conversion: bool = False):
     """
     data = gpd.read_file(config["geom_path"])
     if conversion:
-        point = gauge_to_utm(gdf_file=data[data["gauge_id"] == str(post_num)])
+        point = gauge_to_utm(gauge_series=data[data["gauge_id"] == str(post_num)])
     else:
         point = data[data["gauge_id"] == str(post_num)][["geometry"]].values[0][0]
     return point.y, point.x  # lat lon
@@ -231,8 +203,8 @@ def find_posts_coords(post_num: int, config: dict, conversion: bool = False):
 
 def coords_to_xy(dem_path, coords):
     """Translate coords to point on tiff float in fractions."""
-    grid = Grid.from_raster(dem_path)
-    dem = grid.read_raster(dem_path)
+    grid = Grid.from_raster(dem_path, nodata=0)
+    dem = grid.read_raster(dem_path, nodata=0)
 
     lat_min, lat_max = (
         np.min(dem.coords[:, 0]),
@@ -242,6 +214,9 @@ def coords_to_xy(dem_path, coords):
     x = (coords[0] - lat_min) / (lat_max - lat_min)
     y = (coords[1] - lon_min) / (lon_max - lon_min)
     if x < 0 or y < 0 or x > 1 or y > 1:
+        logger.warning(
+            f"incorrect coordinates: {coords} , {lat_min}, {lat_max}, {lon_min}, {lon_max}, {x}, {y}. Return middle point"
+        )
         return 0.5, 0.5
     return x, y
 
